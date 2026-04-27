@@ -1,5 +1,117 @@
 import numpy as np
 
+_CHUNK_SIZE = 256
+
+
+def load_compressed_ply(path: str):
+    """
+    Load a SuperSplat .compressed.ply file.
+
+    Chunk-local dequantization gives significantly better position and rotation
+    precision than the global 8-bit quantization used by the .splat format.
+
+    Returns (positions, scales, colors, opacities, rotations) with the same
+    dtypes and semantics as load_splat().
+    """
+    with open(path, "rb") as f:
+        chunk_count = 0
+        vertex_count = 0
+        while True:
+            line = f.readline().decode("ascii", errors="replace").strip()
+            if line.startswith("element chunk"):
+                chunk_count = int(line.split()[-1])
+            elif line.startswith("element vertex"):
+                vertex_count = int(line.split()[-1])
+            elif line == "end_header":
+                break
+
+        chunk_dtype = np.dtype([
+            ("min_x",       np.float32), ("min_y",       np.float32), ("min_z",       np.float32),
+            ("max_x",       np.float32), ("max_y",       np.float32), ("max_z",       np.float32),
+            ("min_scale_x", np.float32), ("min_scale_y", np.float32), ("min_scale_z", np.float32),
+            ("max_scale_x", np.float32), ("max_scale_y", np.float32), ("max_scale_z", np.float32),
+            ("min_r",       np.float32), ("min_g",       np.float32), ("min_b",       np.float32),
+            ("max_r",       np.float32), ("max_g",       np.float32), ("max_b",       np.float32),
+        ])
+        chunks = np.frombuffer(f.read(chunk_count * 18 * 4), dtype=chunk_dtype)
+
+        vertex_dtype = np.dtype([
+            ("packed_position", np.uint32),
+            ("packed_rotation", np.uint32),
+            ("packed_scale",    np.uint32),
+            ("packed_color",    np.uint32),
+        ])
+        vertices = np.frombuffer(f.read(vertex_count * 16), dtype=vertex_dtype)
+
+    ci = np.arange(vertex_count) // _CHUNK_SIZE
+    ch = chunks[ci]
+
+    # ---- positions  (pack111011: x=bits21-31, y=bits11-20, z=bits0-10) ----
+    pp = vertices["packed_position"]
+    x_bits = (pp >> 21) & 0x7FF  # 11 bits → 0..2047
+    y_bits = (pp >> 11) & 0x3FF  # 10 bits → 0..1023
+    z_bits =  pp        & 0x7FF  # 11 bits → 0..2047
+
+    positions = np.column_stack([
+        ch["min_x"] + (ch["max_x"] - ch["min_x"]) * x_bits / 2047.0,
+        ch["min_y"] + (ch["max_y"] - ch["min_y"]) * y_bits / 1023.0,
+        ch["min_z"] + (ch["max_z"] - ch["min_z"]) * z_bits / 2047.0,
+    ]).astype(np.float32)
+
+    # ---- scales  (pack111011, stored in log space → exp for linear σ) ----
+    ps = vertices["packed_scale"]
+    sx_bits = (ps >> 21) & 0x7FF
+    sy_bits = (ps >> 11) & 0x3FF
+    sz_bits =  ps        & 0x7FF
+
+    log_sx = ch["min_scale_x"] + (ch["max_scale_x"] - ch["min_scale_x"]) * sx_bits / 2047.0
+    log_sy = ch["min_scale_y"] + (ch["max_scale_y"] - ch["min_scale_y"]) * sy_bits / 1023.0
+    log_sz = ch["min_scale_z"] + (ch["max_scale_z"] - ch["min_scale_z"]) * sz_bits / 2047.0
+    scales = np.exp(np.column_stack([log_sx, log_sy, log_sz])).astype(np.float32)
+
+    # ---- colors + opacity  (pack8888: r=bits24-31, g=bits16-23, b=bits8-15, a=bits0-7) ----
+    pc = vertices["packed_color"]
+    r_bits = (pc >> 24) & 0xFF
+    g_bits = (pc >> 16) & 0xFF
+    b_bits = (pc >>  8) & 0xFF
+    a_bits =  pc        & 0xFF
+
+    colors = np.column_stack([
+        ch["min_r"] + (ch["max_r"] - ch["min_r"]) * r_bits / 255.0,
+        ch["min_g"] + (ch["max_g"] - ch["min_g"]) * g_bits / 255.0,
+        ch["min_b"] + (ch["max_b"] - ch["min_b"]) * b_bits / 255.0,
+    ]).astype(np.float32)
+    opacities = (a_bits / 255.0).astype(np.float32)
+
+    # ---- rotations  (smallest-3, 2+10+10+10 bits) ----
+    # Layout: largest_idx=bits30-31, comp0=bits20-29, comp1=bits10-19, comp2=bits0-9
+    # Components ordered by original [x,y,z,w] index, skipping largest.
+    pr = vertices["packed_rotation"]
+    comp2_bits   =  pr        & 0x3FF
+    comp1_bits   = (pr >> 10) & 0x3FF
+    comp0_bits   = (pr >> 20) & 0x3FF
+    largest_idx  = (pr >> 30).astype(np.int32)
+
+    # packUnorm(v * sqrt(2)/2 + 0.5, 10) → invert: (bits/1023 - 0.5) * sqrt(2)
+    _NORM = np.float32(np.sqrt(2.0))
+    comp0    = (comp0_bits / np.float32(1023.0) - 0.5) * _NORM
+    comp1    = (comp1_bits / np.float32(1023.0) - 0.5) * _NORM
+    comp2    = (comp2_bits / np.float32(1023.0) - 0.5) * _NORM
+    comp_drop = np.sqrt(np.clip(1.0 - comp0**2 - comp1**2 - comp2**2, 0.0, None)).astype(np.float32)
+
+    rotations = np.zeros((vertex_count, 4), dtype=np.float32)
+    for drop in range(4):
+        mask = largest_idx == drop
+        if not np.any(mask):
+            continue
+        stored = [i for i in range(4) if i != drop]
+        rotations[mask, stored[0]] = comp0[mask]
+        rotations[mask, stored[1]] = comp1[mask]
+        rotations[mask, stored[2]] = comp2[mask]
+        rotations[mask, drop]      = comp_drop[mask]
+
+    return positions, scales, colors, opacities, rotations
+
 
 def load_splat(path: str):
     raw = np.fromfile(path, dtype=np.uint8)

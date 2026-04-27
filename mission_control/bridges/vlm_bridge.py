@@ -57,6 +57,7 @@ class VLMBridge:
             telemetry_data = parse_telemetry(self.mission_context.last_telemetry_path_cache)
             telemetry_prompt_text = telemetry_data[0]
             drone_height = telemetry_data[1]
+            camera_fov_deg = telemetry_data[2]
         except FileNotFoundError as e:
             print(f"Error: No telemetry found '{self.mission_context.last_telemetry_path_cache}'. Data may be deleted.")
             raise e
@@ -66,7 +67,7 @@ class VLMBridge:
 
         # --- Image Processing ---
         try:
-            img_new = add_grid(self.mission_context.last_photo_path_cache, drone_height)
+            img_new = add_grid(self.mission_context.last_photo_path_cache, drone_height, camera_fov_deg)
         except FileNotFoundError as e:
             print(f"Error: No photo found '{self.mission_context.last_photo_path_cache}'. Photo may be deleted.")
             raise e

@@ -12,6 +12,7 @@ from mission_control.core.action_status import ActionStatus
 from mission_control.core.config import Config
 from mission_control.core.exceptions import DroneError, VLMError, ChatError
 from mission_control.core.mission_context import MissionContext
+from mission_control.gs_photo_source import GSPhotoSource
 from mission_control.managers.chat_manager import ChatSessionManager
 from mission_control.managers.prompt_manager import PromptManager
 from mission_control.utils.parsers import parse_prompt_arguments, parse_search_arguments
@@ -53,6 +54,7 @@ class MissionControl:
         self.commands: Dict[str, Callable[[str, str], Awaitable[None]]] = {
 
             "search": lambda _, args: self._handle_search(args),
+            "gs_search": lambda _, args: self._handle_gs_search(args),
 
             "chat_init": lambda c, a: self.chat_manager.create_new_session(),
             "chat_save": lambda _, args: self.chat_manager.save_session(args),
@@ -247,6 +249,110 @@ class MissionControl:
                     print(f"[WARN] Failed to stop recording: {e}")
             await self.chat_manager.reset_session()
 
+    ''' -------------- GS SEARCH SEQUENCE -------------- '''
+    async def gs_search(self, name: str, kind: str, kv: dict) -> None:
+        """
+        Like search() but photo comes from a Gaussian-splat render instead
+        of the drone camera.  No drone connection is required.
+
+        The splat renderer is initialised once from environment variables
+        (or sensible defaults) and re-used across the whole loop so the
+        splat file is only loaded from disk a single time.
+
+        Environment variables (all optional):
+          GS_SPLAT_PATH       path to splat file            (default: splats/BS.compressed.ply)
+          GS_START_X/Y/Z      initial position in metres   (default: 0 / 50 / 0)
+          GS_METRES_PER_UNIT  scene-unit to metre scale     (default: 1.0)
+          GS_WIDTH/HEIGHT     render resolution             (default: 1024 / 1024)
+          GS_FOV              field of view degrees         (default: 70)
+          GS_JPEG_QUALITY     JPEG quality 1-95             (default: 95)
+          GS_SPLAT_RADIUS     sigma multiplier for splat bbox (default: 3.0)
+          GS_EWA_MIN          EWA anti-alias min variance   (default: 0.0)
+          GS_MAX_ANISOTROPY   spike/streak clamp ratio      (default: 10.0)
+          GS_SUPERSAMPLE      supersampling factor          (default: 2)
+          GS_DEVICE           auto | cuda | cpu             (default: auto)
+          GS_MAX_SPLATS       cap for dev/debug             (default: none)
+        """
+        import os
+
+        print("\n--- GS SEARCH... ---")
+        try:
+            await self.web_server.broadcast_state(
+                custom_status="GS Search in progress... Initialising renderer."
+            )
+
+            # ---- renderer / photo source ----
+            max_splats_env = os.environ.get("GS_MAX_SPLATS")
+            gs_source = GSPhotoSource(
+                splat_path=os.environ.get("GS_SPLAT_PATH", "splats/BS.compressed.ply"),
+                upload_dir=self.config.upload_dir,
+                telemetry_dir=self.config.telemetry_dir,
+                start_x=float(os.environ.get("GS_START_X", "0")),
+                start_y=float(os.environ.get("GS_START_Y", "50")),
+                start_z=float(os.environ.get("GS_START_Z", "0")),
+                metres_per_unit=float(os.environ.get("GS_METRES_PER_UNIT", "1.0")),
+                width=int(os.environ.get("GS_WIDTH", "1024")),
+                height=int(os.environ.get("GS_HEIGHT", "1024")),
+                fov_deg=float(os.environ.get("GS_FOV", "70")),
+                jpeg_quality=int(os.environ.get("GS_JPEG_QUALITY", "95")),
+                splat_radius=float(os.environ.get("GS_SPLAT_RADIUS", "3.0")),
+                ewa_min=float(os.environ.get("GS_EWA_MIN", "0.0")),
+                max_anisotropy=float(os.environ.get("GS_MAX_ANISOTROPY", "10.0")),
+                supersample=int(os.environ.get("GS_SUPERSAMPLE", "2")),
+                device=os.environ.get("GS_DEVICE", "auto"),
+                max_splats=int(max_splats_env) if max_splats_env else None,
+            )
+
+            # ---- initial prompt + chat session ----
+            self.prompt_manager.generate_and_save(kind, kv)
+            await self.chat_manager.create_new_session()
+            await self.chat_manager.save_session(name)
+
+            ret = ActionStatus.CONFIRMED
+            moves_performed = 0
+            move_limit = int(kv["glimpses"])
+
+            while (
+                ret in [ActionStatus.CONFIRMED, ActionStatus.WARNING]
+                and moves_performed < move_limit
+            ):
+                await self.web_server.broadcast_state(
+                    custom_status=f"GS render at {gs_source.position_m} ..."
+                )
+
+                # ---- render and cache ----
+                photo_path, telemetry_path = await asyncio.get_running_loop().run_in_executor(
+                    None, gs_source.capture_and_save
+                )
+                self.mission_context.last_photo_path_cache = photo_path
+                self.mission_context.last_telemetry_path_cache = telemetry_path
+
+                # ---- VLM ----
+                await self.vlm.send_to_vlm(is_warning=(ret == ActionStatus.WARNING))
+                await self.chat_manager.save_session(name)
+
+                parsed = self.mission_context.parsed_response
+                ret = await self._confirm_send(found=parsed.found, move=parsed.move)
+
+                if ret == ActionStatus.CONFIRMED:
+                    if parsed.move:
+                        gs_source.apply_move(*parsed.move)
+                    moves_performed += 1
+                elif ret == ActionStatus.FOUND:
+                    await self.web_server.broadcast_state(custom_status="FOUND.")
+                    print("FOUND")
+
+            await self.web_server.broadcast_state(custom_status="GS Search ended.")
+
+        except (VLMError, ChatError) as e:
+            print(f"[GS_SEARCH FAILED] {e}")
+            await self.web_server.broadcast_state(custom_status=str(e))
+        except Exception as e:
+            print(f"[GS_SEARCH FAILED] Unexpected error: {e}")
+            await self.web_server.broadcast_state(custom_status=str(e))
+        finally:
+            await self.chat_manager.reset_session()
+
     ''' -------------- HELPER METHODS --------------'''
 
     async def _confirm_send(self, move=None, found=False):
@@ -303,6 +409,11 @@ class MissionControl:
         """ Handle search command - parse the arguments and send them further. """
         name, kind, kv = parse_search_arguments(args)
         await self.search(name, kind, kv)
+
+    async def _handle_gs_search(self, args):
+        """ Handle gs_search command — same args as search but uses GS renderer. """
+        name, kind, kv = parse_search_arguments(args)
+        await self.gs_search(name, kind, kv)
 
     async def _handle_prompt_cmd(self, args):
         """ Handle prompt command - parse the arguments and send them further. """
@@ -419,6 +530,7 @@ class MissionControl:
 def print_help():
     print("Perform search:")
     print("    SEARCH <name> <FS-1|FS-2> [object=.. glimpses=.. area=.. minimum_altitude=..]")
+    print("    GS_SEARCH <name> <FS-1|FS-2> [object=.. glimpses=.. area=.. minimum_altitude=..] (Gaussian-splat simulation, no drone needed)")
 
     print("Chat management:")
     print("    CHAT_INIT | CHAT_RESET | CHAT_SAVE <name> | CHAT_RETRIEVE <name>")

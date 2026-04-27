@@ -36,9 +36,11 @@ x-producer-common: &producer_common
 
 services:
   server:
-    build: 
+    build:
       context: ..
       dockerfile: Dockerfile
+      args:
+        TORCH_INDEX_URL: "${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu121}"
     image: flysearch:latest
     command: python3 -u -m mission_control.main
     working_dir: /app
@@ -66,6 +68,22 @@ services:
         PULL_BATCH_SIZE: "${PULL_BATCH_SIZE:-2}"
         PULL_CHUNK_BYTES: "${PULL_CHUNK_BYTES:-524288}"
         RECORD_FPS: "${RECORD_FPS:-30}"
+        # Gaussian-splat renderer
+        GS_SPLAT_PATH: "${GS_SPLAT_PATH:-/app/splats/BS.compressed.ply}"
+        GS_START_X: "${GS_START_X:-0}"
+        GS_START_Y: "${GS_START_Y:-40}"
+        GS_START_Z: "${GS_START_Z:-0}"
+        GS_METRES_PER_UNIT: "${GS_METRES_PER_UNIT:-1.0}"
+        GS_WIDTH: "${GS_WIDTH:-1024}"
+        GS_HEIGHT: "${GS_HEIGHT:-1024}"
+        GS_FOV: "${GS_FOV:-70}"
+        GS_JPEG_QUALITY: "${GS_JPEG_QUALITY:-95}"
+        GS_SPLAT_RADIUS: "${GS_SPLAT_RADIUS:-3.0}"
+        GS_EWA_MIN: "${GS_EWA_MIN:-0.0}"
+        GS_MAX_ANISOTROPY: "${GS_MAX_ANISOTROPY:-10.0}"
+        GS_SUPERSAMPLE: "${GS_SUPERSAMPLE:-2}"
+        GS_DEVICE: "${GS_DEVICE:-cpu}"
+        GS_MAX_SPLATS: "${GS_MAX_SPLATS:-}"
     tty: true
     stdin_open: true
     ports:
@@ -73,7 +91,7 @@ services:
       - "127.0.0.1:8000:8000"
     profiles: ["server"]
     
-  # drone / RPi hardware for actual workflow
+  # drone / RPi hardware for actual workflow — run this on the Raspberry Pi
   producer:
     <<: *producer_common
     profiles: ["producer"]
@@ -81,27 +99,17 @@ services:
       <<: *producer_env
       MAV_DEVICE: "${MAV_DEVICE:-/dev/ttyAMA0}"
 
-    # allow opening camera/media devices without privileged
     device_cgroup_rules:
-      - "c 81:* rmw"     # /dev/video* and /dev/v4l-subdev* (video4linux)
-      - "c 235:* rmw"    # /dev/media* (media controller)
-      - 'c 253:* rmw'
+      - "c 81:* rmw"
+      - "c 235:* rmw"
+      - "c 253:* rmw"
 
     group_add:
       - video
 
-    # keep your serial device explicit
     devices:
       - /dev/ttyAMA0:/dev/ttyAMA0
       - /dev/video0:/dev/video0
-      - /dev/video1:/dev/video1
-      - /dev/media0:/dev/media0
-      - /dev/media1:/dev/media1
-      - /dev/media2:/dev/media2
-      - /dev/media3:/dev/media3
-      - /dev/v4l-subdev0:/dev/v4l-subdev0
-      - /dev/v4l-subdev1:/dev/v4l-subdev1
-      - /dev/v4l-subdev2:/dev/v4l-subdev2
     
   # no-drone / laptop-friendly for tests without drone
   producer_test:

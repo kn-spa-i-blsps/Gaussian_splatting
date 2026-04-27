@@ -9,7 +9,8 @@ from mission_control.core.exceptions import ParsingError
 def parse_telemetry(path):
     """ Parses telemetry data from JSON file.
 
-        Returns message for the VLM about current height.
+        Returns [telemetry_text, altitude_m, camera_fov_deg].
+        camera_fov_deg defaults to 90 when not present (real drone telemetry).
     """
 
     with open(path, "r", encoding="utf-8") as f:
@@ -19,7 +20,8 @@ def parse_telemetry(path):
     height = telemetry_data.get("position", {}).get("alt")
     if height is None:
         height = 10
-    return [f"Your current altitude is {height} meters above ground level.", height]
+    fov_deg = telemetry_data.get("camera_fov_deg", 90)
+    return [f"Your current altitude is {height} meters above ground level.", height, fov_deg]
 
 def parse_prompt_arguments(cmd):
     """Divides arguments for the prompt command.

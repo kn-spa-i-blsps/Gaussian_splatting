@@ -50,10 +50,19 @@ RUN if [ "${TARGETARCH}" = "arm64" ] || [ "${TARGETARCH}" = "arm" ]; then \
 
 WORKDIR /app
 
-# Install Python deps in a cache-friendly way
+# PyTorch wheel index: override at build time for CUDA support.
+# CPU (default):  docker build .
+# CUDA 12.1:      docker build --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu121 .
+# CUDA 12.4:      docker build --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu124 .
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
+
+# Install Python deps in a cache-friendly way.
+# PyTorch is installed first from the chosen wheel index; the rest of
+# requirements.txt is installed afterwards (torch is already present, skipped).
 COPY requirements.txt /app/requirements.txt
 RUN python3 -m venv --system-site-packages "${VIRTUAL_ENV}" \
   && "${VIRTUAL_ENV}/bin/python" -m pip install --no-cache-dir --upgrade pip \
+  && "${VIRTUAL_ENV}/bin/python" -m pip install --no-cache-dir torch --index-url "${TORCH_INDEX_URL}" \
   && "${VIRTUAL_ENV}/bin/python" -m pip install --no-cache-dir -r /app/requirements.txt
 
 # Refresh font cache (optional, but useful if you render text)
